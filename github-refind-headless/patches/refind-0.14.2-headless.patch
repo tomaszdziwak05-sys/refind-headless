@@ -1,0 +1,237 @@
+--- a/refind/config.c
++++ b/refind/config.c
+@@ -762,6 +762,15 @@
+                 HandleString(TokenList, TokenCount, &(GlobalConfig.DefaultSelection));
+             }
+ 
++        } else if (MyStriCmp(TokenList[0], L"monitor_default_selection")) {
++            HandleString(TokenList, TokenCount, &(GlobalConfig.MonitorDefaultSelection));
++
++        } else if (MyStriCmp(TokenList[0], L"headless_default_selection")) {
++            HandleString(TokenList, TokenCount, &(GlobalConfig.HeadlessDefaultSelection));
++
++        } else if (MyStriCmp(TokenList[0], L"monitor_auto_timeout")) {
++            HandleInt(TokenList, TokenCount, &(GlobalConfig.MonitorAutoTimeout));
++
+         } else if (MyStriCmp(TokenList[0], L"textonly")) {
+             GlobalConfig.TextOnly = HandleBoolean(TokenList, TokenCount);
+ 
+--- a/refind/global.h
++++ b/refind/global.h
+@@ -393,6 +393,10 @@
+    UINT32_LIST      *CsrValues;
+    UINTN            ShowTools[NUM_TOOLS];
+    CHAR8            ScanFor[NUM_SCAN_OPTIONS]; // codes of types of loaders for which to scan
++   // Monitor-aware boot policy extensions.
++   CHAR16           *MonitorDefaultSelection;
++   CHAR16           *HeadlessDefaultSelection;
++   UINTN            MonitorAutoTimeout;
+ } REFIT_CONFIG;
+ 
+ // Global variables
+--- a/refind/main.c
++++ b/refind/main.c
+@@ -153,7 +153,11 @@
+                               /* CsrValues = */ NULL,
+                               /* ShowTools = */ { TAG_SHELL, TAG_MEMTEST, TAG_GDISK, TAG_APPLE_RECOVERY, TAG_WINDOWS_RECOVERY,
+                                                   TAG_MOK_TOOL, TAG_ABOUT, TAG_HIDDEN, TAG_SHUTDOWN, TAG_REBOOT, TAG_FIRMWARE,
+-                                                  TAG_FWUPDATE_TOOL, 0, 0, 0, 0, 0, 0, 0, 0, 0 }
++                                                  TAG_FWUPDATE_TOOL, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
++                              /* ScanFor = */ { 0 },
++                              /* MonitorDefaultSelection = */ NULL,
++                              /* HeadlessDefaultSelection = */ NULL,
++                              /* MonitorAutoTimeout = */ 5
+                             };
+ 
+ CHAR16 *gHiddenTools = NULL;
+@@ -464,6 +468,146 @@
+ } // VOID LogBasicInfo()
+ 
+ //
++// Early monitor-aware boot support. This runs before InitScreen(), SetupScreen(),
++// theme loading, icon loading, and menu construction. EDID is a firmware hint,
++// not a universal detector of a physically attached display.
++//
++typedef struct {
++    UINT32 SizeOfEdid;
++    UINT8  *Edid;
++} REFIND_EARLY_EDID_PROTOCOL;
++
++static EFI_GUID EarlyEdidActiveGuid =
++    { 0xBD8C1056, 0x9F36, 0x44EC, { 0x92, 0xA8, 0xA6, 0x33, 0x7F, 0x81, 0x79, 0x86 } };
++static EFI_GUID EarlyEdidDiscoveredGuid =
++    { 0x1C0C34F6, 0xD380, 0x41FA, { 0xA0, 0x49, 0x8A, 0xD0, 0x6C, 0x1A, 0x66, 0xAA } };
++static EFI_GUID HeadlessTrueNasGuid =
++    { 0xe111363b, 0x0d34, 0x4d54, { 0xb4, 0x5a, 0xc5, 0x92, 0xe9, 0xbe, 0x7e, 0x2c } };
++
++static VOID HeadlessTrace(CHAR16 *Message)
++{
++    EFI_STATUS Status;
++    EFI_FILE_PROTOCOL *TraceFile = NULL;
++    UINTN Size;
++    CHAR16 Line[256];
++
++    if (SelfRootDir == NULL || Message == NULL)
++        return;
++
++    SPrint(Line, sizeof(Line), L"%s\r\n", Message);
++    Status = refit_call5_wrapper(SelfRootDir->Open, SelfRootDir, &TraceFile,
++                                 L"boot_trace.txt",
++                                 EFI_FILE_MODE_READ | EFI_FILE_MODE_WRITE | EFI_FILE_MODE_CREATE, 0);
++    if (EFI_ERROR(Status) || TraceFile == NULL)
++        return;
++
++    refit_call2_wrapper(TraceFile->SetPosition, TraceFile, 0xFFFFFFFFFFFFFFFFULL);
++    Size = StrSize(Line) - sizeof(CHAR16);
++    refit_call3_wrapper(TraceFile->Write, TraceFile, &Size, Line);
++    refit_call1_wrapper(TraceFile->Close, TraceFile);
++}
++
++static BOOLEAN ProtocolHasUsableEdid(EFI_GUID *ProtocolGuid)
++{
++    EFI_STATUS Status;
++    EFI_HANDLE *Handles = NULL;
++    UINTN Count = 0, Index;
++    BOOLEAN Found = FALSE;
++
++    Status = refit_call5_wrapper(BS->LocateHandleBuffer, ByProtocol, ProtocolGuid,
++                                 NULL, &Count, &Handles);
++    if (EFI_ERROR(Status) || Handles == NULL || Count == 0)
++        return FALSE;
++
++    for (Index = 0; Index < Count; Index++) {
++        REFIND_EARLY_EDID_PROTOCOL *Edid = NULL;
++        Status = refit_call3_wrapper(BS->HandleProtocol, Handles[Index], ProtocolGuid,
++                                     (VOID **)&Edid);
++        if (!EFI_ERROR(Status) && Edid != NULL && Edid->Edid != NULL &&
++            Edid->SizeOfEdid >= 128 && Edid->Edid[0] == 0x00 &&
++            Edid->Edid[1] == 0xff && Edid->Edid[2] == 0xff &&
++            Edid->Edid[3] == 0xff && Edid->Edid[4] == 0xff &&
++            Edid->Edid[5] == 0xff && Edid->Edid[6] == 0xff &&
++            Edid->Edid[7] == 0x00) {
++            Found = TRUE;
++            break;
++        }
++    }
++
++    MyFreePool(Handles);
++    return Found;
++}
++
++static BOOLEAN EarlyMonitorPresent(VOID)
++{
++    return ProtocolHasUsableEdid(&EarlyEdidActiveGuid) ||
++           ProtocolHasUsableEdid(&EarlyEdidDiscoveredGuid);
++}
++
++static EFI_STATUS StartHeadlessTrueNas(VOID)
++{
++    EFI_STATUS Status;
++    EFI_STATUS ReinitStatus;
++    EFI_HANDLE ChildImage = NULL;
++    EFI_DEVICE_PATH *DevicePath;
++    UINTN ExitDataSize = 0;
++    CHAR16 *ExitData = NULL;
++    UINTN Index;
++    REFIT_VOLUME *Volume = NULL;
++    CHAR16 *LoaderPath = L"\\EFI\\debian\\grubx64.efi";
++
++    // This implementation intentionally supports the supplied TrueNAS target.
++    // Do not silently launch that fixed target if the config names another OS.
++    if (GlobalConfig.HeadlessDefaultSelection != NULL &&
++        MyStriCmp(GlobalConfig.HeadlessDefaultSelection, L"TrueNAS")) {
++        HeadlessTrace(L"HEADLESS: configured target is not TrueNAS; refusing fixed fallback");
++        return EFI_UNSUPPORTED;
++    }
++
++    for (Index = 0; Index < VolumesCount; Index++) {
++        if (GuidsAreEqual(&Volumes[Index]->PartGuid, &HeadlessTrueNasGuid)) {
++            Volume = Volumes[Index];
++            break;
++        }
++    }
++
++    if (Volume == NULL || Volume->DeviceHandle == NULL) {
++        HeadlessTrace(L"HEADLESS: TrueNAS partition GUID not found");
++        return EFI_NOT_FOUND;
++    }
++
++    HeadlessTrace(L"HEADLESS: TrueNAS partition found; calling LoadImage");
++    DevicePath = FileDevicePath(Volume->DeviceHandle, LoaderPath);
++    if (DevicePath == NULL)
++        return EFI_OUT_OF_RESOURCES;
++
++    Status = refit_call6_wrapper(BS->LoadImage, FALSE, SelfImageHandle,
++                                 DevicePath, NULL, 0, &ChildImage);
++    MyFreePool(DevicePath);
++    if (EFI_ERROR(Status)) {
++        HeadlessTrace(L"HEADLESS: LoadImage failed");
++        return Status;
++    }
++
++    HeadlessTrace(L"HEADLESS: releasing rEFInd filesystem handles before StartImage");
++    UninitRefitLib();
++    Status = refit_call3_wrapper(BS->StartImage, ChildImage, &ExitDataSize, &ExitData);
++    ReinitStatus = ReinitRefitLib();
++
++    if (ExitData != NULL)
++        MyFreePool(ExitData);
++    refit_call1_wrapper(BS->UnloadImage, ChildImage);
++
++    if (EFI_ERROR(ReinitStatus))
++        return ReinitStatus;
++
++    // A bootloader that returns control did not complete the hand-off. Treat
++    // even EFI_SUCCESS here as a failed boot and never fall through to graphics.
++    HeadlessTrace(L"HEADLESS: GRUB returned control; refusing GUI fallback");
++    return EFI_ERROR(Status) ? Status : EFI_ABORTED;
++}
++
++//
+ // main entry point
+ //
+ EFI_STATUS
+@@ -473,6 +617,7 @@
+     EFI_STATUS         Status;
+     BOOLEAN            MainLoopRunning = TRUE;
+     BOOLEAN            MokProtocol;
++    BOOLEAN            MonitorPresent;
+     REFIT_MENU_ENTRY   *ChosenEntry;
+     UINTN              MenuExit = MENU_EXIT_ENTER, i;
+     CHAR16             *SelectionName = NULL;
+@@ -484,6 +629,10 @@
+     if (EFI_ERROR(Status))
+         return Status;
+ 
++    HeadlessTrace(L"BOOT: efi_main entered; probing EDID before volume scan and screen setup");
++    MonitorPresent = EarlyMonitorPresent();
++    HeadlessTrace(MonitorPresent ? L"BOOT: usable EDID found" : L"BOOT: no usable EDID found");
++
+     // read configuration
+     MyCopyMem(GlobalConfig.ScanFor, "ieom       ", NUM_SCAN_OPTIONS);
+     FindLegacyBootType();
+@@ -497,6 +646,24 @@
+     // by the drivers.
+     ScanVolumes();
+     ReadConfig(GlobalConfig.ConfigFilename);
++
++    if (!MonitorPresent) {
++        HeadlessTrace(L"BOOT: headless path selected; graphics and menu will be skipped");
++        if (GlobalConfig.HeadlessDefaultSelection != NULL)
++            HeadlessTrace(GlobalConfig.HeadlessDefaultSelection);
++        Status = StartHeadlessTrueNas();
++        HeadlessTrace(L"BOOT: headless chainload failed or returned; returning to firmware");
++        return Status;
++    }
++
++    if (GlobalConfig.MonitorDefaultSelection != NULL) {
++        MyFreePool(GlobalConfig.DefaultSelection);
++        GlobalConfig.DefaultSelection = StrDuplicate(GlobalConfig.MonitorDefaultSelection);
++    }
++    if (GlobalConfig.MonitorAutoTimeout > 0)
++        GlobalConfig.Timeout = GlobalConfig.MonitorAutoTimeout;
++    HeadlessTrace(L"BOOT: monitor path selected; continuing normal rEFInd GUI");
++
+     if (GlobalConfig.LogLevel > 0) {
+         StartLogging(FALSE);
+         LogBasicInfo();

@@ -1,0 +1,4 @@
+The rEFInd project is licensed under GNU GPL version 3 or (at your option) any later version.
+This repository contains a patch intended to modify rEFInd 0.14.2. The patch is provided
+under the same license terms as the upstream project. See https://www.gnu.org/licenses/gpl-3.0.html
+and the upstream source archive for the complete license text.
