@@ -1,0 +1,101 @@
+name: Build rEFInd headless (0.14.2)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main, master ]
+    paths:
+      - '.github/workflows/build.yml'
+      - 'patches/**'
+      - 'README.md'
+  pull_request:
+    paths:
+      - '.github/workflows/build.yml'
+      - 'patches/**'
+      - 'README.md'
+
+permissions:
+  contents: read
+
+jobs:
+  build-x64:
+    name: Build x86_64 EFI with GNU-EFI
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Check out this repository
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential binutils gnu-efi patch curl ca-certificates file
+
+      - name: Download and verify upstream rEFInd 0.14.2 source
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --fail --location --retry 3 --retry-all-errors \
+            'https://sourceforge.net/projects/refind/files/0.14.2/refind-src-0.14.2.tar.gz/download' \
+            --output refind-src-0.14.2.tar.gz
+          echo 'f7d93ce80da76b86c567281ea225b6a87907ce86ff77233c9357a522c115c8f0  refind-src-0.14.2.tar.gz' \
+            | sha256sum --check --strict
+          mkdir upstream
+          tar -xzf refind-src-0.14.2.tar.gz -C upstream
+          test -f upstream/refind-0.14.2/Makefile
+          grep -Fq '#define REFIND_VERSION L"0.14.2"' \
+            upstream/refind-0.14.2/include/version.h
+
+      - name: Apply and validate headless patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd upstream/refind-0.14.2
+          patch --batch --forward --fuzz=0 -p1 \
+            --dry-run < "$GITHUB_WORKSPACE/patches/refind-0.14.2-headless.patch"
+          patch --batch --forward --fuzz=0 -p1 \
+            < "$GITHUB_WORKSPACE/patches/refind-0.14.2-headless.patch"
+
+      - name: Compile rEFInd for x86_64
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd upstream/refind-0.14.2
+          make clean
+          make gnuefi
+          test -s refind/refind_x64.efi
+          file refind/refind_x64.efi
+          objdump -f refind/refind_x64.efi
+          objdump -f refind/refind_x64.efi | grep -q 'pei-x86-64'
+
+      - name: Prepare BOOTX64.EFI package
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist/EFI/BOOT
+          cp upstream/refind-0.14.2/refind/refind_x64.efi dist/EFI/BOOT/BOOTX64.EFI
+          cp upstream/refind-0.14.2/refind.conf-sample dist/refind.conf.example
+          cat > dist/BUILD-INFO.txt <<EOF
+          Project: rEFInd monitor/headless build
+          Upstream: rEFInd 0.14.2
+          Architecture: x86_64 UEFI
+          Toolchain: GNU-EFI (Ubuntu 22.04)
+          Source archive SHA-256: f7d93ce80da76b86c567281ea225b6a87907ce86ff77233c9357a522c115c8f0
+          Git commit: ${GITHUB_SHA}
+          Workflow run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}
+          EOF
+          (cd dist && zip -r ../BOOTX64-EFI-headless.zip EFI refind.conf.example BUILD-INFO.txt)
+          sha256sum dist/EFI/BOOT/BOOTX64.EFI BOOTX64-EFI-headless.zip | tee dist/SHA256SUMS.txt
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: BOOTX64-EFI-headless-${{ github.sha }}
+          path: |
+            BOOTX64-EFI-headless.zip
+            dist/EFI/BOOT/BOOTX64.EFI
+            dist/refind.conf.example
+            dist/BUILD-INFO.txt
+            dist/SHA256SUMS.txt
+          if-no-files-found: error
+          retention-days: 30
